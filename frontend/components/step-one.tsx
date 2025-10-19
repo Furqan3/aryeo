@@ -23,7 +23,7 @@ export function StepOne({ onComplete }: StepOneProps) {
     setLoading(true)
 
     try {
-      const response = await fetch("http://localhost:8000/scrape", {
+      const response = await fetch("http://159.203.94.74:8000/scrape", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ listing_url: url }),

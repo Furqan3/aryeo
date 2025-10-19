@@ -185,9 +185,6 @@ export function StepFour({ sessionId, heroImage, detailImages, onBack }: StepFou
                 className="object-cover"
               />
             </div>
-            <p className="text-sm text-muted-foreground mt-2">
-              Note: For iPhone, tap and hold the image, then select "Save to Photos" from the menu.
-            </p>
             <Button
               onClick={saveImageToCameraRoll}
               className="w-full mt-4 bg-accent hover:bg-accent/90 text-accent-foreground"

@@ -11,7 +11,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from fastapi.middleware.cors import CORSMiddleware 
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.chrome.service import Service
 import time
 import re
 import os
@@ -163,7 +162,6 @@ def init_driver(headless: bool = True) -> webdriver.Chrome:
     
     return driver
 
-
 def login_to_aryeo(driver: webdriver.Chrome) -> bool:
     """Login to Aryeo using credentials from document 2"""
     try:
@@ -243,219 +241,108 @@ def extract_id_from_url(url: str) -> str:
     raise ValueError("Could not extract listing ID from URL")
 
 def scrape_listing_images(driver: webdriver.Chrome, listing_url: str) -> List[str]:
-    """Scrape image URLs from Aryeo listing page with robust error handling."""
+    """Scrape image URLs from Aryeo listing page."""
     try:
-        # Step 1: Login
         if not login_to_aryeo(driver):
             raise Exception("Login failed")
 
-        # Step 2: Convert to download-center URL
-        logger.info(f"Original listing URL: {listing_url}")
-        listing_url = download_link(listing_url)
-        logger.info(f"Converted to download-center URL: {listing_url}")
-        
-        # Step 3: Navigate with retry logic
-        max_retries = 3
-        page_loaded = False
-        
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Navigation attempt {attempt + 1}/{max_retries}")
-                driver.set_page_load_timeout(60)  # 60 second timeout
-                driver.get(listing_url)
-                
-                # Wait for page to be ready
-                WebDriverWait(driver, 30).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-                logger.info("✅ Page loaded successfully")
-                page_loaded = True
-                break
-                
-            except TimeoutException:
-                if attempt < max_retries - 1:
-                    logger.warning(f"⏱️ Timeout on attempt {attempt + 1}, retrying in 3 seconds...")
-                    time.sleep(3)
-                    continue
-                else:
-                    # On final attempt, try to use what we have
-                    logger.warning("⚠️ Final timeout, stopping page load and proceeding...")
-                    try:
-                        driver.execute_script("window.stop();")
-                        page_loaded = True
-                    except Exception as stop_error:
-                        logger.error(f"Could not stop page load: {stop_error}")
-                        
-            except Exception as nav_error:
-                if attempt < max_retries - 1:
-                    logger.warning(f"❌ Error on attempt {attempt + 1}: {str(nav_error)}, retrying...")
-                    time.sleep(3)
-                    continue
-                else:
-                    logger.error(f"Navigation failed after {max_retries} attempts")
-                    raise
-        
-        if not page_loaded:
-            raise Exception("Failed to load page after all retries")
-        
-        # Wait a bit for dynamic content
+        logger.info(f"Navigating to listing: {listing_url}")
+        listing_url=download_link(listing_url)
+        driver.get(listing_url)
         time.sleep(5)
         
-        # Step 4: Scroll to load lazy-loaded images
-        logger.info("📜 Scrolling to load images...")
-        try:
-            # Scroll down 3 times
-            for i in range(3):
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
-                logger.info(f"  Scroll {i + 1}/3 complete")
-            
-            # Scroll back to top
-            driver.execute_script("window.scrollTo(0, 0);")
+        # Scroll to load all images
+        logger.info("Scrolling to load images...")
+        for _ in range(3):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
-            logger.info("  Scrolled back to top")
-        except Exception as scroll_error:
-            logger.warning(f"⚠️ Scrolling error (continuing anyway): {str(scroll_error)}")
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(2)
         
-        # Step 5: Collect images using multiple methods
         image_urls = []
         seen_urls = set()
         
-        # METHOD 1: Find <img> elements
-        logger.info("🔍 Method 1: Searching <img> elements...")
-        try:
-            images = driver.find_elements(By.TAG_NAME, "img")
-            logger.info(f"  Found {len(images)} img elements")
-            
-            for img in images:
-                try:
-                    src = (img.get_attribute('src') or 
-                           img.get_attribute('data-src') or
-                           img.get_attribute('data-lazy-src'))
-                    
-                    if src and 'cdn.aryeo.com' in src and '/resized/' in src and src not in seen_urls:
-                        image_urls.append(src)
-                        seen_urls.add(src)
-                except Exception as img_error:
-                    continue
-            
-            logger.info(f"  ✅ Method 1 found {len(image_urls)} images")
-        except Exception as method1_error:
-            logger.warning(f"  ⚠️ Method 1 error (continuing): {str(method1_error)}")
+        # Method 1: Find img elements
+        images = driver.find_elements(By.TAG_NAME, "img")
+        logger.info(f"Found {len(images)} img elements")
         
-        # METHOD 2: Check background-image in style attributes
-        logger.info("🔍 Method 2: Checking style attributes...")
-        method2_count = 0
-        try:
-            all_elements = driver.find_elements(By.XPATH, "//*[@style]")
-            logger.info(f"  Checking {len(all_elements)} elements with style attributes")
-            
-            for elem in all_elements:
-                try:
-                    style = elem.get_attribute('style')
-                    if style and 'cdn.aryeo.com' in style and '/resized/' in style:
-                        # Extract URL from background-image: url(...)
-                        urls = re.findall(r'url\(["\']?(https://cdn\.aryeo\.com[^"\')\s]+)["\']?\)', style)
-                        for url in urls:
-                            if '/resized/' in url and url not in seen_urls:
-                                image_urls.append(url)
-                                seen_urls.add(url)
-                                method2_count += 1
-                except Exception as elem_error:
-                    continue
-            
-            logger.info(f"  ✅ Method 2 found {method2_count} additional images")
-        except Exception as method2_error:
-            logger.warning(f"  ⚠️ Method 2 error (continuing): {str(method2_error)}")
-        
-        # METHOD 3: JavaScript execution to find all CDN URLs
-        logger.info("🔍 Method 3: JavaScript page scan...")
-        method3_count = 0
-        try:
-            js_script = """
-            const urls = new Set();
-            
-            // Check all img elements
-            document.querySelectorAll('img').forEach(img => {
-                const src = img.src || img.dataset.src || img.dataset.lazySrc;
-                if (src && src.includes('cdn.aryeo.com') && src.includes('/resized/')) {
-                    urls.add(src);
-                }
-            });
-            
-            // Check all elements with background images
-            document.querySelectorAll('*').forEach(el => {
-                try {
-                    const style = window.getComputedStyle(el).backgroundImage;
-                    if (style && style.includes('cdn.aryeo.com') && style.includes('/resized/')) {
-                        const match = style.match(/url\\(["\']?(.*?)["\']?\\)/);
-                        if (match && match[1]) urls.add(match[1]);
-                    }
-                } catch(e) {}
-            });
-            
-            return Array.from(urls);
-            """
-            
-            js_urls = driver.execute_script(js_script)
-            logger.info(f"  JavaScript found {len(js_urls)} total URLs")
-            
-            for url in js_urls:
-                if url and url not in seen_urls:
-                    image_urls.append(url)
-                    seen_urls.add(url)
-                    method3_count += 1
-            
-            logger.info(f"  ✅ Method 3 found {method3_count} additional images")
-        except Exception as method3_error:
-            logger.warning(f"  ⚠️ Method 3 error (continuing): {str(method3_error)}")
-        
-        # Step 6: Final results
-        logger.info(f"🎉 Total unique CDN images found: {len(image_urls)}")
-        
-        # Step 7: Debug if no images found
-        if len(image_urls) == 0:
-            logger.error("❌ NO IMAGES FOUND! Saving debug information...")
+        for img in images:
             try:
-                # Save screenshot
-                screenshot_path = "debug_no_images.png"
-                driver.save_screenshot(screenshot_path)
-                logger.error(f"📸 Screenshot saved to: {screenshot_path}")
+                src = (img.get_attribute('src') or 
+                       img.get_attribute('data-src') or
+                       img.get_attribute('data-lazy-src'))
                 
-                # Log page info
-                logger.error(f"📄 Page title: {driver.title}")
-                logger.error(f"🔗 Current URL: {driver.current_url}")
-                
-                # Check what images ARE on the page
-                all_imgs = driver.find_elements(By.TAG_NAME, "img")
-                logger.error(f"🖼️ Total <img> elements found: {len(all_imgs)}")
-                
-                # Log sample of image sources
-                for i, img in enumerate(all_imgs[:5]):
-                    src = img.get_attribute('src')
-                    logger.error(f"  Sample img {i + 1}: {src}")
-                
-                # Save page source for inspection
-                with open("debug_page_source.html", "w", encoding="utf-8") as f:
-                    f.write(driver.page_source)
-                logger.error(f"💾 Page source saved to: debug_page_source.html")
-                
-            except Exception as debug_error:
-                logger.error(f"⚠️ Could not save debug info: {str(debug_error)}")
+                if src and 'cdn.aryeo.com' in src and '/resized/' in src and src not in seen_urls:
+                    image_urls.append(src)
+                    seen_urls.add(src)
+            except:
+                continue
+        
+        # Method 2: Check for background images in style attributes
+        all_elements = driver.find_elements(By.XPATH, "//*[@style]")
+        logger.info(f"Checking {len(all_elements)} elements with style attributes")
+        
+        for elem in all_elements:
+            try:
+                style = elem.get_attribute('style')
+                if style and 'cdn.aryeo.com' in style and '/resized/' in style:
+                    # Extract URL from background-image: url(...)
+                    urls = re.findall(r'url\(["\'][](https://cdn\.aryeo\.com[^"\')\s]+)["\']?\)', style)
+                    for url in urls:
+                        if '/resized/' in url and url not in seen_urls:
+                            image_urls.append(url)
+                            seen_urls.add(url)
+            except:
+                continue
+        
+        # Method 3: Execute JavaScript to find all CDN URLs in the page
+        logger.info("Searching for CDN URLs in page content...")
+        js_script = """
+        const urls = new Set();
+        
+        // Check all img elements
+        document.querySelectorAll('img').forEach(img => {
+            const src = img.src || img.dataset.src || img.dataset.lazySrc;
+            if (src && src.includes('cdn.aryeo.com') && src.includes('/resized/')) {
+                urls.add(src);
+            }
+        });
+        
+        // Check all elements with background images
+        document.querySelectorAll('*').forEach(el => {
+            const style = window.getComputedStyle(el).backgroundImage;
+            if (style && style.includes('cdn.aryeo.com') && style.includes('/resized/')) {
+                const match = style.match(/url\\(["\']?(.*?)["\']?\\)/);
+                if (match) urls.add(match[1]);
+            }
+        });
+        
+        return Array.from(urls);
+        """
+        
+        js_urls = driver.execute_script(js_script)
+        for url in js_urls:
+            if url not in seen_urls:
+                image_urls.append(url)
+                seen_urls.add(url)
+        
+        logger.info(f"Total CDN images found: {len(image_urls)}")
+        
+        # Debug: if no images found, save screenshot
+        if len(image_urls) == 0:
+            logger.warning("No images found! Saving debug screenshot...")
+            driver.save_screenshot("debug_no_images.png")
+            logger.debug(f"Page title: {driver.title}")
+            
+            # Log sample of all img src found
+            all_imgs = driver.find_elements(By.TAG_NAME, "img")
+            for i, img in enumerate(all_imgs[:3]):
+                logger.debug(f"Sample img {i}: {img.get_attribute('src')}")
         
         return image_urls
 
     except Exception as e:
-        logger.error(f"💥 Critical scraping error: {str(e)}")
-        logger.error(f"Error type: {type(e).__name__}")
-        
-        # Try to save debug info even on error
-        try:
-            driver.save_screenshot("debug_error.png")
-            logger.error("📸 Error screenshot saved to: debug_error.png")
-        except:
-            pass
-        
+        logger.error(f"Scraping error: {str(e)}")
         raise
 
 def get_original_url(resized_url: str) -> str:
@@ -545,7 +432,7 @@ def download_image(url_or_path: str, cookies_hash: str = None) -> Optional[Image
 
 def create_social_media_post(hero_img: Image.Image, detail_imgs: list, property_info) -> Image.Image:
     """
-    Enhanced real estate social media post with responsive address typography.
+    Enhanced real estate social media post with improved typography.
     
     Typography improvements:
     - Better font hierarchy with distinct sizes
@@ -553,7 +440,6 @@ def create_social_media_post(hero_img: Image.Image, detail_imgs: list, property_
     - Better contrast and visual balance
     - Optimized text positioning and alignment
     - Enhanced readability with proper line heights
-    - Responsive address sizing based on length
     """
     width, height = 1080, 1080
     
@@ -583,16 +469,11 @@ def create_social_media_post(hero_img: Image.Image, detail_imgs: list, property_
         font_regular_specs_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
         
         # Bottom section fonts - better hierarchy
-        font_title_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 50)
-        
-        # Responsive address fonts
-        font_address_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 42)
-        font_address_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
-        font_address_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
+        font_title_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70)
+        font_address = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
     except:
-        font_bold_label = font_bold_value = font_regular_specs = font_title_large = ImageFont.load_default()
+        font_bold_label = font_bold_value = font_regular_specs = font_title_large = font_address = ImageFont.load_default()
         font_regular_specs_small = ImageFont.load_default()
-        font_address_large = font_address_medium = font_address_small = ImageFont.load_default()
     
     # Create canvas
     canvas = Image.new("RGB", (width, height), WHITE)
@@ -634,23 +515,6 @@ def create_social_media_post(hero_img: Image.Image, detail_imgs: list, property_
         if current:
             lines.append(current)
         return lines
-    
-    def get_responsive_address_font(draw, text, max_width, available_height):
-        """Choose the best font size that fits the address in the available space."""
-        fonts = [
-            (font_address_large, 40),  # (font, line_height)
-            (font_address_medium, 34),
-            (font_address_small, 28)
-        ]
-        
-        for font, line_height in fonts:
-            lines = wrap_text(draw, text, font, max_width)
-            total_height = len(lines) * line_height
-            if total_height <= available_height:
-                return font, lines, line_height
-        
-        # If still doesn't fit, return smallest with lines
-        return font_address_small, wrap_text(draw, text, font_address_small, max_width), 28
     
     # ==========================================
     # HERO IMAGE
@@ -757,7 +621,7 @@ def create_social_media_post(hero_img: Image.Image, detail_imgs: list, property_
             canvas.paste(img, (idx * detail_width, detail_y))
     
     # ==========================================
-    # BOTTOM SECTION (RESPONSIVE ADDRESS)
+    # BOTTOM SECTION (ENHANCED TYPOGRAPHY)
     # ==========================================
     bottom_y = detail_y + DETAIL_HEIGHT
     draw.rectangle([(0, bottom_y), (width, height)], fill=DARK_GRAY)
@@ -766,36 +630,25 @@ def create_social_media_post(hero_img: Image.Image, detail_imgs: list, property_
     title_text = type_text
     title_x = 50
     title_y = bottom_y + 30
+    draw.text((title_x, title_y), title_text, fill=WHITE, font=font_title_large)
     
-    # Calculate available space for address
-    title_bbox = draw.textbbox((0, 0), title_text, font=font_title_large)
-    title_height = title_bbox[3] - title_bbox[1]
-    
-    # Available height for address (with padding)
-    available_height = BOTTOM_HEIGHT - title_height - 60  # 30 top padding + 30 bottom padding
-    max_width = width - 100  # 50px margin on each side
-    
-    # Address with responsive sizing
+    # Address with improved line height
     address_text = f"{property_info.address}, {property_info.city}, {property_info.state}"
     if property_info.zip_code:
         address_text += f" {property_info.zip_code}"
     
-    # Get the best fitting font and wrapped lines
-    address_font, address_lines, line_height = get_responsive_address_font(
-        draw, address_text, max_width, available_height
-    )
+    address_lines = wrap_text(draw, address_text, font_address, width - 100)
     
-    # Draw title
-    # draw.text((title_x, title_y), title_text, fill=WHITE, font=font_title_large)
-    
-    # Draw address with responsive font
-    address_y = title_y + title_height 
+    title_bbox = draw.textbbox((0, 0), title_text, font=font_title_large)
+    address_y = title_y + (title_bbox[3] - title_bbox[1]) + 15
+    line_height = 36  # Better line spacing for readability
     
     for line in address_lines:
-        draw.text((title_x, address_y), line, fill=WHITE, font=address_font)
-        address_y += line_height+10
+        draw.text((title_x, address_y), line, fill=WHITE, font=font_address)
+        address_y += line_height
     
     return canvas
+
 def image_to_base64(img: Image.Image) -> str:
     """Convert PIL Image to base64"""
     buffered = io.BytesIO()
